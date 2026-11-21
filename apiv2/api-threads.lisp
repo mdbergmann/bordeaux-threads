@@ -33,16 +33,43 @@
           (with-lock-held (.known-threads-lock.)
             (incf .thread-counter.))))
 
+;; AmiLisp has no weak hash tables, so .KNOWN-THREADS. holds every native
+;; thread it was ever told about, and with it the wrapper, its lock, its name
+;; and the thread function's return values: an image that keeps making
+;; short-lived threads (WITH-TIMEOUT makes one per call) grows without bound.
+;; A thread made by MAKE-THREAD takes its own entry out when it ends (see
+;; ESTABLISH-DYNAMIC-ENV).  A thread made elsewhere that merely asked for
+;; CURRENT-THREAD has no such exit: for those, every so many new entries the
+;; ones whose thread has ended are swept.
+#+amilisp
+(define-global-var* .known-threads-added. 0)
+
+#+amilisp
+(defun %note-thread-wrapper-added ()
+  "To be called with .KNOWN-THREADS-LOCK. held, after a new entry went in."
+  (when (>= (incf .known-threads-added.) 64)
+    (setf .known-threads-added. 0)
+    (let ((dead '()))
+      (maphash (lambda (native-thread thread)
+                 (declare (ignore thread))
+                 (unless (%thread-alive-p native-thread)
+                   (push native-thread dead)))
+               .known-threads.)
+      (dolist (native-thread dead)
+        (remhash native-thread .known-threads.)))))
+
 (defun ensure-thread-wrapper (native-thread)
   (with-lock-held (.known-threads-lock.)
     (multiple-value-bind (thread presentp)
         (gethash native-thread .known-threads.)
       (if presentp
           thread
-          (setf (gethash native-thread .known-threads.)
-                (make-instance 'thread
-                               :name (%thread-name native-thread)
-                               :native-thread native-thread))))))
+          (prog1
+              (setf (gethash native-thread .known-threads.)
+                    (make-instance 'thread
+                                   :name (%thread-name native-thread)
+                                   :native-thread native-thread))
+            #+amilisp (%note-thread-wrapper-added))))))
 
 (defun %get-thread-wrapper (native-thread)
   (multiple-value-bind (thread presentp)
@@ -55,7 +82,9 @@
 
 (defun (setf thread-wrapper) (thread native-thread)
   (with-lock-held (.known-threads-lock.)
-    (setf (gethash native-thread .known-threads.) thread)))
+    (prog1
+        (setf (gethash native-thread .known-threads.) thread)
+      #+amilisp (%note-thread-wrapper-added))))
 
 (defun remove-thread-wrapper (native-thread)
   (with-lock-held (.known-threads-lock.)
@@ -125,7 +154,8 @@ FUNCTION."
          (values (mapcar (lambda (f) (eval (cdr f))) bindings)))
     (named-lambda %establish-dynamic-env-wrapper ()
       (progv specials values
-        (with-slots (%lock %return-values %exit-condition #+genera native-thread)
+        (with-slots (%lock %return-values %exit-condition
+                     #+(or genera amilisp) native-thread)
             thread
           (flet ((record-condition (c)
                    (with-lock-held (%lock)
@@ -150,10 +180,11 @@ FUNCTION."
                      (handler-bind
                          ((condition #'record-condition))
                        (values-list (run-function))))
-              ;; Genera doesn't support weak key hash tables. If we don't remove
-              ;; the native-thread object's entry from the hash table here, we'll
-              ;; never be able to GC the native-thread after it terminates
-              #+genera (remove-thread-wrapper native-thread))))))))
+              ;; Genera and AmiLisp don't support weak key hash tables. If we
+              ;; don't remove the native-thread object's entry from the hash
+              ;; table here, we'll never be able to GC the native-thread after
+              ;; it terminates
+              #+(or genera amilisp) (remove-thread-wrapper native-thread))))))))
 
 
 ;;;
